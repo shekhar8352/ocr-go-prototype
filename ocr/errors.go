@@ -7,6 +7,7 @@ import (
 )
 
 // Sentinel errors for common failure modes.
+// Use errors.Is to check for these errors when handling failures from Extract.
 var (
 	ErrUnsupportedFormat   = errors.New("ocr: unsupported file format")
 	ErrFileTooLarge        = errors.New("ocr: file exceeds maximum allowed size")
@@ -24,7 +25,8 @@ var (
 	ErrURLFetchFailed      = errors.New("ocr: failed to fetch image from URL")
 )
 
-// OCRError wraps errors with additional context.
+// OCRError wraps errors with additional context for tracing and inspection.
+// It implements the error interface and supports errors.Unwrap and errors.As.
 type OCRError struct {
 	Op        string // Operation that failed (e.g., "Extract", "LoadImage")
 	RequestID string // Request ID for tracing

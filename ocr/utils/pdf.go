@@ -9,28 +9,31 @@ import (
 	"strings"
 )
 
+// PDFOptions configures PDF-to-image conversion.
+type PDFOptions struct {
+	MaxPages int
+}
+
 // PDFToImages converts a PDF to a slice of PNG image byte slices, one per page.
-// This implementation uses a system call to a tool that can render PDFs.
-// For production use, consider using a Go-native PDF rendering library.
-//
-// Strategy: We try multiple approaches in order:
-// 1. Use 'pdftoppm' (poppler-utils) if available
-// 2. Use 'sips' (macOS built-in) for single-page conversion
-// 3. Return the raw PDF bytes as a single "page" for Ollama to process directly
-func PDFToImages(pdfPath string) ([][]byte, error) {
-	// Try pdftoppm first (most reliable for multi-page PDFs)
-	if pages, err := pdfToPPM(pdfPath); err == nil && len(pages) > 0 {
-		return pages, nil
-	}
-
-	// Fallback: return the raw PDF data as a single entry.
-	// Many vision models can process PDF data directly when sent as base64.
-	data, err := os.ReadFile(pdfPath)
+// Requires pdftoppm (poppler-utils) to be installed.
+func PDFToImages(pdfPath string, opts PDFOptions) ([][]byte, error) {
+	pages, err := pdfToPPM(pdfPath)
 	if err != nil {
-		return nil, fmt.Errorf("pdf fallback read: %w", err)
+		if _, lookErr := exec.LookPath("pdftoppm"); lookErr != nil {
+			return nil, fmt.Errorf("%w: install poppler-utils (e.g. brew install poppler)", ErrPDFToolUnavailable)
+		}
+		return nil, fmt.Errorf("%w: %v", ErrPDFParseFailed, err)
 	}
 
-	return [][]byte{data}, nil
+	if len(pages) == 0 {
+		return nil, fmt.Errorf("%w: PDF produced no pages", ErrPDFParseFailed)
+	}
+
+	if opts.MaxPages > 0 && len(pages) > opts.MaxPages {
+		return nil, fmt.Errorf("%w: %d pages exceeds maximum %d", ErrPDFTooManyPages, len(pages), opts.MaxPages)
+	}
+
+	return pages, nil
 }
 
 // pdfToPPM uses pdftoppm from poppler-utils to convert PDF pages to PNG images.
@@ -53,7 +56,6 @@ func pdfToPPM(pdfPath string) ([][]byte, error) {
 		return nil, fmt.Errorf("pdftoppm failed: %s: %w", string(output), err)
 	}
 
-	// Read all generated PNG files
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
 		return nil, fmt.Errorf("read temp dir: %w", err)
@@ -77,4 +79,10 @@ func pdfToPPM(pdfPath string) ([][]byte, error) {
 	}
 
 	return pages, nil
+}
+
+// PDFToolAvailable reports whether pdftoppm is available on the system.
+func PDFToolAvailable() bool {
+	_, err := exec.LookPath("pdftoppm")
+	return err == nil
 }

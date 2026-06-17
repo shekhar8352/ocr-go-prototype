@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"image"
@@ -8,11 +10,13 @@ import (
 	_ "image/jpeg" // Register JPEG decoder
 	_ "image/png"  // Register PNG decoder
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/sudhanshushekhar/ocr-go-prototype/ocr/models"
 )
@@ -29,29 +33,29 @@ var SupportedExtensions = map[string]bool{
 func ValidateFilePath(path string, maxSize int64) error {
 	ext := strings.ToLower(filepath.Ext(path))
 	if !SupportedExtensions[ext] {
-		return fmt.Errorf("unsupported extension %q", ext)
+		return fmt.Errorf("%w: %q", ErrUnsupportedExtension, ext)
 	}
 
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("file not found: %s", path)
+			return fmt.Errorf("%w: %s", ErrFileNotFound, path)
 		}
 		return fmt.Errorf("stat file: %w", err)
 	}
 
 	if info.IsDir() {
-		return fmt.Errorf("path is a directory, not a file: %s", path)
+		return fmt.Errorf("%w: %s", ErrPathIsDirectory, path)
 	}
 
 	if info.Size() > maxSize {
-		return fmt.Errorf("file size %d exceeds maximum %d bytes", info.Size(), maxSize)
+		return fmt.Errorf("%w: file size %d exceeds maximum %d bytes", ErrFileTooLarge, info.Size(), maxSize)
 	}
 
 	return nil
 }
 
-// ValidateURL checks that a URL is well-formed and uses http/https.
+// ValidateURL checks that a URL is well-formed, uses http/https, and does not target private hosts.
 func ValidateURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -59,32 +63,60 @@ func ValidateURL(rawURL string) error {
 	}
 
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("unsupported URL scheme: %s (only http and https are allowed)", u.Scheme)
+		return fmt.Errorf("%w: %s (only http and https are allowed)", ErrInvalidURLScheme, u.Scheme)
 	}
 
 	if u.Host == "" {
 		return fmt.Errorf("URL has no host")
 	}
 
-	// Block private/internal IPs for SSRF protection
-	host := strings.ToLower(u.Hostname())
-	blockedPrefixes := []string{"127.", "10.", "192.168.", "172.16.", "172.17.", "172.18.",
-		"172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
-		"172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31."}
-	blockedHosts := []string{"localhost", "0.0.0.0", "[::1]"}
+	return validateHost(u.Hostname())
+}
 
+// validateHost blocks private, loopback, and link-local addresses.
+func validateHost(host string) error {
+	host = strings.ToLower(strings.Trim(host, "[]"))
+
+	blockedHosts := []string{"localhost", "0.0.0.0"}
 	for _, blocked := range blockedHosts {
 		if host == blocked {
-			return fmt.Errorf("URL points to a blocked host: %s", host)
+			return fmt.Errorf("%w: %s", ErrUnsafeURL, host)
 		}
 	}
-	for _, prefix := range blockedPrefixes {
-		if strings.HasPrefix(host, prefix) {
-			return fmt.Errorf("URL points to a private network: %s", host)
+
+	if ip := net.ParseIP(host); ip != nil {
+		if isBlockedIP(ip) {
+			return fmt.Errorf("%w: %s", ErrUnsafeURL, host)
+		}
+		return nil
+	}
+
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		// Allow DNS failures here; the download step will fail naturally.
+		return nil
+	}
+
+	for _, ip := range ips {
+		if isBlockedIP(ip) {
+			return fmt.Errorf("%w: %s resolves to blocked IP %s", ErrUnsafeURL, host, ip.String())
 		}
 	}
 
 	return nil
+}
+
+func isBlockedIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return true
+	}
+
+	// Block IPv6 unique local addresses (fc00::/7).
+	if ip.To16() != nil && ip.To4() == nil {
+		return ip[0]&0xfe == 0xfc
+	}
+
+	return false
 }
 
 // IsURL returns true if the source looks like a URL.
@@ -102,8 +134,26 @@ func LoadImageFromFile(path string) ([]byte, error) {
 }
 
 // DownloadImage fetches an image from a URL and returns its bytes.
-func DownloadImage(rawURL string, maxSize int64) ([]byte, error) {
-	resp, err := http.Get(rawURL)
+func DownloadImage(ctx context.Context, rawURL string, maxSize int64) ([]byte, error) {
+	client := &http.Client{
+		Timeout: 60 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects")
+			}
+			if err := validateHost(req.URL.Hostname()); err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create download request: %w", err)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("download image: %w", err)
 	}
@@ -113,7 +163,6 @@ func DownloadImage(rawURL string, maxSize int64) ([]byte, error) {
 		return nil, fmt.Errorf("download image: HTTP %d", resp.StatusCode)
 	}
 
-	// Limit reader to prevent downloading excessively large files
 	limited := io.LimitReader(resp.Body, maxSize+1)
 	data, err := io.ReadAll(limited)
 	if err != nil {
@@ -121,7 +170,7 @@ func DownloadImage(rawURL string, maxSize int64) ([]byte, error) {
 	}
 
 	if int64(len(data)) > maxSize {
-		return nil, fmt.Errorf("downloaded file exceeds maximum size of %d bytes", maxSize)
+		return nil, fmt.Errorf("%w: downloaded file exceeds maximum size of %d bytes", ErrFileTooLarge, maxSize)
 	}
 
 	return data, nil
@@ -144,7 +193,7 @@ func GetImageInfo(data []byte, ext string) models.ImageInfo {
 		}
 	}
 
-	cfg, _, err := image.DecodeConfig(strings.NewReader(string(data)))
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
 		return models.ImageInfo{
 			Width:     0,
@@ -179,6 +228,17 @@ func GetImageInfo(data []byte, ext string) models.ImageInfo {
 		DPI:       nil, // DPI not easily extractable from Go's image package
 		ColorMode: colorMode,
 	}
+}
+
+// ValidateImageDimensions checks that image width and height do not exceed maxDimension.
+func ValidateImageDimensions(info models.ImageInfo, maxDimension int) error {
+	if maxDimension <= 0 {
+		return nil
+	}
+	if info.Width > maxDimension || info.Height > maxDimension {
+		return fmt.Errorf("%w: %dx%d exceeds maximum %d pixels per side", ErrImageTooLarge, info.Width, info.Height, maxDimension)
+	}
+	return nil
 }
 
 // FileExtension returns the lowercase extension for a source path or URL.
