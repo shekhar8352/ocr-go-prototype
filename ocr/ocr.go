@@ -12,6 +12,7 @@ package ocr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -27,21 +28,21 @@ import (
 // It accepts a local file path or a remote URL, and returns a fully
 // structured OCRResult with strict JSON-compatible output.
 //
-// Usage:
+// Errors are returned as *OCRError values wrapping sentinel errors such as
+// ErrUnsupportedFormat, ErrFileTooLarge, ErrOllamaUnavailable, and ErrInvalidJSONResponse.
+// Use errors.As and errors.Is to inspect them.
 //
-//	result, err := ocr.Extract(ctx, "/path/to/image.png")
-//	result, err := ocr.Extract(ctx, "https://example.com/doc.jpg", ocr.WithSummary(true))
+// By default, output validation failures are logged as warnings and the result
+// is still returned. Enable strict mode with WithStrictValidation(true) to
+// return ErrValidationFailed instead.
 func Extract(ctx context.Context, source string, opts ...Option) (*models.OCRResult, error) {
-	// Generate request ID
 	requestID := generateRequestID()
 
-	// Build config
 	cfg := DefaultConfig()
 	for _, opt := range opts {
 		opt(cfg)
 	}
 
-	// Create logger
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -54,16 +55,13 @@ func Extract(ctx context.Context, source string, opts ...Option) (*models.OCRRes
 		slog.String("source", source),
 	)
 
-	// Validate source
 	if source == "" {
 		return nil, NewOCRError("Extract", requestID, ErrEmptySource)
 	}
 
-	// Create context with timeout
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
 
-	// Determine source type and load image data
 	var (
 		imageData  []byte
 		sourceType models.SourceType
@@ -88,9 +86,9 @@ func Extract(ctx context.Context, source string, opts ...Option) (*models.OCRRes
 			slog.String("url", source),
 		)
 
-		imageData, err = utils.DownloadImage(source, cfg.MaxFileSize)
+		imageData, err = utils.DownloadImage(ctx, source, cfg.MaxFileSize)
 		if err != nil {
-			return nil, NewOCRError("Extract.DownloadImage", requestID, fmt.Errorf("%w: %v", ErrURLFetchFailed, err))
+			return nil, mapDownloadError("Extract.DownloadImage", requestID, err)
 		}
 
 		checksum = utils.SHA256Bytes(imageData)
@@ -100,7 +98,7 @@ func Extract(ctx context.Context, source string, opts ...Option) (*models.OCRRes
 		isPDF = ext == ".pdf"
 
 		if err := utils.ValidateFilePath(source, cfg.MaxFileSize); err != nil {
-			return nil, NewOCRError("Extract.ValidateFile", requestID, fmt.Errorf("%w: %v", ErrFileNotFound, err))
+			return nil, mapFileValidationError("Extract.ValidateFile", requestID, err)
 		}
 
 		imageData, err = utils.LoadImageFromFile(source)
@@ -114,24 +112,32 @@ func Extract(ctx context.Context, source string, opts ...Option) (*models.OCRRes
 		}
 	}
 
-	// Get image info
-	imageInfo = utils.GetImageInfo(imageData, ext)
+	if !isPDF {
+		imageInfo = utils.GetImageInfo(imageData, ext)
+		if err := utils.ValidateImageDimensions(imageInfo, cfg.MaxImageDimension); err != nil {
+			return nil, NewOCRError("Extract.ValidateDimensions", requestID, fmt.Errorf("%w: %v", ErrImageDecodeFailed, err))
+		}
+	} else {
+		imageInfo = utils.GetImageInfo(imageData, ext)
+	}
 
-	// Create Ollama client
 	ollamaClient := client.NewOllamaClient(cfg.OllamaURL, cfg.Timeout)
 
-	// Ping Ollama
 	if err := ollamaClient.Ping(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil, NewOCRError("Extract.Ping", requestID, fmt.Errorf("%w: %v", ErrContextCanceled, ctx.Err()))
+		}
 		return nil, NewOCRError("Extract.Ping", requestID, fmt.Errorf("%w: %v", ErrOllamaUnavailable, err))
 	}
 
-	// Create engine
 	eng := engine.NewVisionEngine(ollamaClient, logger)
 
 	processCfg := engine.ProcessConfig{
 		Model:                    cfg.Model,
 		Temperature:              cfg.Temperature,
 		RequestID:                requestID,
+		MaxRetries:               cfg.MaxRetries,
+		MaxPDFPages:              cfg.MaxPDFPages,
 		WithSummary:              cfg.WithSummary,
 		WithLanguageDetection:    cfg.WithLanguageDetection,
 		WithStructuredExtraction: cfg.WithStructuredExtraction,
@@ -139,11 +145,9 @@ func Extract(ctx context.Context, source string, opts ...Option) (*models.OCRRes
 		WithConfidenceScores:     cfg.WithConfidenceScores,
 	}
 
-	// Process
 	var result *engine.ProcessResult
 	if isPDF {
 		if sourceType == models.SourceTypeURL {
-			// For URL-sourced PDFs, save to tmp and process
 			tmpFile, err := os.CreateTemp("", "ocr-pdf-*.pdf")
 			if err != nil {
 				return nil, NewOCRError("Extract.TempFile", requestID, err)
@@ -155,27 +159,25 @@ func Extract(ctx context.Context, source string, opts ...Option) (*models.OCRRes
 			}
 			tmpFile.Close()
 			result, err = eng.ProcessPDF(ctx, tmpFile.Name(), processCfg)
-			if err != nil {
-				return nil, NewOCRError("Extract.ProcessPDF", requestID, fmt.Errorf("%w: %v", ErrOllamaRequestFailed, err))
-			}
 		} else {
 			result, err = eng.ProcessPDF(ctx, source, processCfg)
-			if err != nil {
-				return nil, NewOCRError("Extract.ProcessPDF", requestID, fmt.Errorf("%w: %v", ErrOllamaRequestFailed, err))
-			}
+		}
+		if err != nil {
+			return nil, mapEngineError("Extract.ProcessPDF", requestID, err)
 		}
 	} else {
 		result, err = eng.Process(ctx, imageData, processCfg)
 		if err != nil {
-			return nil, NewOCRError("Extract.Process", requestID, fmt.Errorf("%w: %v", ErrOllamaRequestFailed, err))
+			return nil, mapEngineError("Extract.Process", requestID, err)
 		}
 	}
 
-	// Build OCRResult from engine result
 	ocrResult := buildOCRResult(source, sourceType, checksum, imageInfo, result, cfg)
 
-	// Validate
 	if err := utils.ValidateOCRResult(ocrResult); err != nil {
+		if cfg.StrictValidation {
+			return nil, NewOCRError("Extract.Validate", requestID, fmt.Errorf("%w: %v", ErrValidationFailed, err))
+		}
 		logger.Warn("output validation failed, returning result anyway",
 			slog.String("validation_error", err.Error()),
 		)
@@ -188,6 +190,45 @@ func Extract(ctx context.Context, source string, opts ...Option) (*models.OCRRes
 	)
 
 	return ocrResult, nil
+}
+
+func mapFileValidationError(op, requestID string, err error) *OCRError {
+	switch {
+	case errors.Is(err, utils.ErrUnsupportedExtension):
+		return NewOCRError(op, requestID, fmt.Errorf("%w: %v", ErrUnsupportedFormat, err))
+	case errors.Is(err, utils.ErrFileTooLarge):
+		return NewOCRError(op, requestID, fmt.Errorf("%w: %v", ErrFileTooLarge, err))
+	case errors.Is(err, utils.ErrFileNotFound), errors.Is(err, utils.ErrPathIsDirectory):
+		return NewOCRError(op, requestID, fmt.Errorf("%w: %v", ErrFileNotFound, err))
+	default:
+		return NewOCRError(op, requestID, err)
+	}
+}
+
+func mapDownloadError(op, requestID string, err error) *OCRError {
+	switch {
+	case errors.Is(err, utils.ErrFileTooLarge):
+		return NewOCRError(op, requestID, fmt.Errorf("%w: %v", ErrFileTooLarge, err))
+	case errors.Is(err, utils.ErrUnsafeURL), errors.Is(err, utils.ErrInvalidURLScheme):
+		return NewOCRError(op, requestID, fmt.Errorf("%w: %v", ErrInvalidURL, err))
+	case errors.Is(context.Canceled, err), errors.Is(context.DeadlineExceeded, err):
+		return NewOCRError(op, requestID, fmt.Errorf("%w: %v", ErrContextCanceled, err))
+	default:
+		return NewOCRError(op, requestID, fmt.Errorf("%w: %v", ErrURLFetchFailed, err))
+	}
+}
+
+func mapEngineError(op, requestID string, err error) *OCRError {
+	switch {
+	case errors.Is(err, engine.ErrInvalidJSONResponse):
+		return NewOCRError(op, requestID, fmt.Errorf("%w: %v", ErrInvalidJSONResponse, err))
+	case errors.Is(err, utils.ErrPDFToolUnavailable), errors.Is(err, utils.ErrPDFParseFailed), errors.Is(err, utils.ErrPDFTooManyPages):
+		return NewOCRError(op, requestID, fmt.Errorf("%w: %v", ErrPDFParseFailed, err))
+	case errors.Is(context.Canceled, err), errors.Is(context.DeadlineExceeded, err):
+		return NewOCRError(op, requestID, fmt.Errorf("%w: %v", ErrContextCanceled, err))
+	default:
+		return NewOCRError(op, requestID, fmt.Errorf("%w: %v", ErrOllamaRequestFailed, err))
+	}
 }
 
 // buildOCRResult assembles the final OCRResult from engine output.
@@ -212,7 +253,6 @@ func buildOCRResult(
 		Summary:        buildSummary(result.VisionResponse, cfg),
 	}
 
-	// Override image info if the model provided it
 	if result.VisionResponse.Image != nil {
 		vi := result.VisionResponse.Image
 		if vi.Width > 0 {
@@ -315,7 +355,7 @@ func buildSummary(resp *models.OllamaVisionResponse, cfg *Config) *string {
 	return resp.Summary
 }
 
-// generateRequestID creates a unique request ID using timestamp + random component.
+// generateRequestID creates a unique request ID using a high-resolution timestamp.
 func generateRequestID() string {
 	return fmt.Sprintf("ocr-%d", time.Now().UnixNano())
 }

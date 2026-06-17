@@ -84,3 +84,38 @@ func WithMaxFileSize(size int64) Option {
 		}
 	}
 }
+
+// WithMaxImageDimension sets the maximum allowed image width or height in pixels.
+func WithMaxImageDimension(dim int) Option {
+	return func(c *Config) {
+		if dim > 0 {
+			c.MaxImageDimension = dim
+		}
+	}
+}
+
+// WithMaxRetries sets the number of retries when the model returns invalid JSON.
+func WithMaxRetries(retries int) Option {
+	return func(c *Config) {
+		if retries >= 0 {
+			c.MaxRetries = retries
+		}
+	}
+}
+
+// WithMaxPDFPages sets the maximum number of PDF pages to process.
+func WithMaxPDFPages(pages int) Option {
+	return func(c *Config) {
+		if pages > 0 {
+			c.MaxPDFPages = pages
+		}
+	}
+}
+
+// WithStrictValidation enables strict output validation. When enabled, validation
+// failures return ErrValidationFailed instead of returning a non-conformant result.
+func WithStrictValidation(enabled bool) Option {
+	return func(c *Config) {
+		c.StrictValidation = enabled
+	}
+}

@@ -23,6 +23,9 @@ const (
 
 	// MaxRetries is the number of retries if JSON parsing fails.
 	MaxRetries = 1
+
+	// DefaultMaxPDFPages is the maximum number of PDF pages to process.
+	DefaultMaxPDFPages = 50
 )
 
 // Config holds all configuration for an OCR extraction request.
@@ -45,6 +48,15 @@ type Config struct {
 	// MaxImageDimension is the max width/height in pixels.
 	MaxImageDimension int
 
+	// MaxRetries is the number of retries on JSON parse failure.
+	MaxRetries int
+
+	// MaxPDFPages is the maximum number of PDF pages to process.
+	MaxPDFPages int
+
+	// StrictValidation causes validation failures to return an error instead of a warning.
+	StrictValidation bool
+
 	// Feature flags
 	WithSummary              bool
 	WithLanguageDetection    bool
@@ -62,6 +74,9 @@ func DefaultConfig() *Config {
 		Temperature:              DefaultTemperature,
 		MaxFileSize:              DefaultMaxFileSize,
 		MaxImageDimension:        DefaultMaxImageDimension,
+		MaxRetries:               MaxRetries,
+		MaxPDFPages:              DefaultMaxPDFPages,
+		StrictValidation:         false,
 		WithSummary:              false,
 		WithLanguageDetection:    true,
 		WithStructuredExtraction: true,

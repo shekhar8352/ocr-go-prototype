@@ -34,7 +34,7 @@ type GenerateRequest struct {
 	Images  []string      `json:"images,omitempty"` // Base64-encoded images
 	Stream  bool          `json:"stream"`
 	Options *ModelOptions `json:"options,omitempty"`
-	Format  string        `json:"format,omitempty"`
+	Format  any           `json:"format,omitempty"`
 }
 
 // ModelOptions holds model-level options for Ollama.
