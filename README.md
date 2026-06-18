@@ -1,21 +1,22 @@
 # OCR Go Prototype
 
-A production-ready Go package for performing OCR (Optical Character Recognition) and document image understanding using locally running Ollama vision models.
+A Go package for performing OCR (Optical Character Recognition) and document image understanding using locally running Ollama vision models.
 
 ## Features
 
 - **Single function API** — call `ocr.Extract()` with a file path or URL
 - **Strict JSON output** — every response conforms to a deterministic schema
 - **Local-only processing** — no cloud APIs, no external services
-- **Multi-format support** — PNG, JPG, JPEG, PDF (page-by-page)
-- **Configurable** — functional options for model, timeout, feature flags
+- **Multi-format support** — PNG, JPG, JPEG, PDF (page-by-page via `pdftoppm`)
+- **Configurable** — functional options for model, timeout, retries, feature flags
 - **Production-ready** — typed errors, structured logging, request tracing, input validation
-- **SSRF protection** — URL sanitization blocks private/internal networks
-- **Retry logic** — automatic retry on JSON parse failure
+- **SSRF protection** — URL sanitization blocks private/internal networks and redirect chains
+- **Retry logic** — configurable retry on JSON parse failure
+- **JSON schema enforcement** — Ollama structured output via JSON schema
 
 ## Prerequisites
 
-- **Go 1.21+**
+- **Go 1.25+**
 - **[Ollama](https://ollama.ai)** running locally at `http://localhost:11434`
 - A vision-capable model pulled in Ollama:
 
@@ -23,7 +24,7 @@ A production-ready Go package for performing OCR (Optical Character Recognition)
 ollama pull llama3.2-vision
 ```
 
-- **Optional**: `pdftoppm` (from `poppler-utils`) for multi-page PDF support
+- **Required for PDF support**: `pdftoppm` (from `poppler-utils`)
 
 ```bash
 # macOS
@@ -85,18 +86,22 @@ func Extract(
 
 ### Options
 
-| Option                           | Description                           | Default           |
-| -------------------------------- | ------------------------------------- | ----------------- |
-| `WithModel(string)`              | Ollama model name                     | `llama3.2-vision` |
-| `WithTimeout(time.Duration)`     | Request timeout                       | `120s`            |
-| `WithSummary(bool)`              | Include natural language summary      | `false`           |
-| `WithLanguageDetection(bool)`    | Detect document language              | `true`            |
-| `WithStructuredExtraction(bool)` | Extract tables + key-value pairs      | `true`            |
-| `WithBoundingBoxes(bool)`        | Include bounding box coordinates      | `true`            |
-| `WithConfidenceScores(bool)`     | Include OCR confidence scores         | `true`            |
-| `WithOllamaURL(string)`          | Custom Ollama API endpoint            | `localhost:11434` |
-| `WithTemperature(float64)`       | Model temperature (0 = deterministic) | `0.1`             |
-| `WithMaxFileSize(int64)`         | Maximum file size in bytes            | `50 MB`           |
+| Option                           | Description                                      | Default           |
+| -------------------------------- | ------------------------------------------------ | ----------------- |
+| `WithModel(string)`              | Ollama model name                                | `llama3.2-vision` |
+| `WithTimeout(time.Duration)`     | Request timeout                                  | `120s`            |
+| `WithSummary(bool)`              | Include natural language summary                 | `false`           |
+| `WithLanguageDetection(bool)`    | Detect document language                         | `true`            |
+| `WithStructuredExtraction(bool)` | Extract tables + key-value pairs                 | `true`            |
+| `WithBoundingBoxes(bool)`        | Include bounding box coordinates                 | `true`            |
+| `WithConfidenceScores(bool)`     | Include OCR confidence scores                    | `true`            |
+| `WithOllamaURL(string)`          | Custom Ollama API endpoint                       | `localhost:11434` |
+| `WithTemperature(float64)`       | Model temperature (0 = deterministic)            | `0.1`             |
+| `WithMaxFileSize(int64)`         | Maximum file size in bytes                       | `50 MB`           |
+| `WithMaxImageDimension(int)`     | Maximum image width/height in pixels             | `8192`            |
+| `WithMaxRetries(int)`            | Retries on invalid JSON from model               | `1`               |
+| `WithMaxPDFPages(int)`           | Maximum PDF pages to process                     | `50`              |
+| `WithStrictValidation(bool)`     | Return error on output validation failure        | `false`           |
 
 ### Output Schema
 
@@ -148,35 +153,44 @@ Every response is strictly typed and conforms to this JSON structure:
 ```
 ocr/
 ├── client/
-│   └── ollama.go           # Ollama HTTP client
+│   ├── ollama.go           # Ollama HTTP client
 │   └── ollama_test.go
 ├── engine/
-│   └── vision.go           # OCR orchestration + retry logic
+│   ├── vision.go           # OCR orchestration + retry logic
+│   └── vision_test.go
 ├── models/
 │   └── output.go           # Strict output structs
 ├── prompt/
-│   └── ocr_prompt.go       # Versioned prompt templates
-│   └── ocr_prompt_test.go
+│   ├── ocr_prompt.go       # Versioned prompt templates
+│   ├── schema.go           # JSON schema for structured output
+│   └── *_test.go
 ├── utils/
 │   ├── hash.go             # SHA-256 checksums
-│   ├── hash_test.go
 │   ├── image.go            # Image loading, validation, SSRF protection
-│   ├── image_test.go
 │   ├── pdf.go              # PDF-to-image conversion
 │   ├── validator.go        # JSON + schema validation
-│   └── validator_test.go
+│   └── *_test.go
 ├── config.go               # Configuration with defaults
 ├── errors.go               # Typed errors
-├── errors_test.go
 ├── ocr.go                  # Public API (Extract function)
 ├── options.go              # Functional options
-└── options_test.go
+└── *_test.go
 ```
 
 ## Running Tests
 
 ```bash
+make test
+make test-race
+make bench
+```
+
+Or directly:
+
+```bash
 go test ./... -v
+go test ./... -race
+go test -bench=. -benchmem ./...
 ```
 
 ## Running the Example
@@ -215,10 +229,43 @@ if err != nil {
         fmt.Println("Request ID:", ocrErr.RequestID)
         fmt.Println("Cause:", ocrErr.Unwrap())
     }
+
+    switch {
+    case errors.Is(err, ocr.ErrUnsupportedFormat):
+        // handle unsupported file type
+    case errors.Is(err, ocr.ErrFileTooLarge):
+        // handle oversized file
+    case errors.Is(err, ocr.ErrInvalidJSONResponse):
+        // handle model JSON failure
+    case errors.Is(err, ocr.ErrPDFParseFailed):
+        // handle PDF conversion failure
+    }
 }
 ```
 
-Sentinel errors: `ErrUnsupportedFormat`, `ErrFileTooLarge`, `ErrInvalidURL`, `ErrFileNotFound`, `ErrOllamaUnavailable`, `ErrInvalidJSONResponse`, and more.
+### Error Catalog
+
+| Sentinel Error           | Typical Cause                              |
+| ------------------------ | ------------------------------------------ |
+| `ErrEmptySource`         | Empty path or URL                          |
+| `ErrUnsupportedFormat`   | File extension not in supported set        |
+| `ErrFileTooLarge`        | File or download exceeds `MaxFileSize`     |
+| `ErrFileNotFound`        | Local file missing or path is a directory  |
+| `ErrInvalidURL`          | Malformed or SSRF-blocked URL              |
+| `ErrImageDecodeFailed`   | Image dimensions exceed `MaxImageDimension`|
+| `ErrPDFParseFailed`      | PDF conversion failed or tool unavailable  |
+| `ErrOllamaUnavailable`   | Ollama server not reachable                |
+| `ErrInvalidJSONResponse` | Model returned unparseable JSON            |
+| `ErrContextCanceled`     | Context timeout or cancellation            |
+| `ErrValidationFailed`    | Output failed schema validation (strict mode)|
+
+## Validation Behavior
+
+By default, output validation failures are logged as warnings and the result is still returned. Enable strict mode to fail on validation errors:
+
+```go
+result, err := ocr.Extract(ctx, source, ocr.WithStrictValidation(true))
+```
 
 ## Logging
 
