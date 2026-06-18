@@ -23,6 +23,15 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.MaxFileSize != DefaultMaxFileSize {
 		t.Errorf("MaxFileSize = %d, want %d", cfg.MaxFileSize, DefaultMaxFileSize)
 	}
+	if cfg.MaxImageDimension != DefaultMaxImageDimension {
+		t.Errorf("MaxImageDimension = %d, want %d", cfg.MaxImageDimension, DefaultMaxImageDimension)
+	}
+	if cfg.MaxRetries != MaxRetries {
+		t.Errorf("MaxRetries = %d, want %d", cfg.MaxRetries, MaxRetries)
+	}
+	if cfg.MaxPDFPages != DefaultMaxPDFPages {
+		t.Errorf("MaxPDFPages = %d, want %d", cfg.MaxPDFPages, DefaultMaxPDFPages)
+	}
 }
 
 func TestOptions(t *testing.T) {
@@ -39,6 +48,10 @@ func TestOptions(t *testing.T) {
 		WithOllamaURL("http://custom:11434"),
 		WithTemperature(0.0),
 		WithMaxFileSize(1024),
+		WithMaxImageDimension(4096),
+		WithMaxRetries(2),
+		WithMaxPDFPages(10),
+		WithStrictValidation(true),
 	}
 
 	for _, opt := range opts {
@@ -74,6 +87,18 @@ func TestOptions(t *testing.T) {
 	}
 	if cfg.MaxFileSize != 1024 {
 		t.Errorf("MaxFileSize = %d, want %d", cfg.MaxFileSize, 1024)
+	}
+	if cfg.MaxImageDimension != 4096 {
+		t.Errorf("MaxImageDimension = %d, want %d", cfg.MaxImageDimension, 4096)
+	}
+	if cfg.MaxRetries != 2 {
+		t.Errorf("MaxRetries = %d, want %d", cfg.MaxRetries, 2)
+	}
+	if cfg.MaxPDFPages != 10 {
+		t.Errorf("MaxPDFPages = %d, want %d", cfg.MaxPDFPages, 10)
+	}
+	if !cfg.StrictValidation {
+		t.Error("StrictValidation should be true")
 	}
 }
 
