@@ -3,6 +3,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -14,6 +15,9 @@ import (
 	"github.com/sudhanshushekhar/ocr-go-prototype/ocr/prompt"
 	"github.com/sudhanshushekhar/ocr-go-prototype/ocr/utils"
 )
+
+// ErrInvalidJSONResponse is returned when the model response cannot be parsed as JSON.
+var ErrInvalidJSONResponse = errors.New("model returned invalid JSON")
 
 // VisionEngine orchestrates the OCR pipeline:
 // load image → build prompt → call Ollama → parse/validate → return result
@@ -35,6 +39,8 @@ type ProcessConfig struct {
 	Model       string
 	Temperature float64
 	RequestID   string
+	MaxRetries  int
+	MaxPDFPages int
 
 	WithSummary              bool
 	WithLanguageDetection    bool
@@ -62,7 +68,6 @@ func (e *VisionEngine) Process(ctx context.Context, imageData []byte, cfg Proces
 		slog.Int("image_bytes", len(imageData)),
 	)
 
-	// Build prompt
 	promptCfg := prompt.PromptConfig{
 		WithSummary:              cfg.WithSummary,
 		WithLanguageDetection:    cfg.WithLanguageDetection,
@@ -72,25 +77,33 @@ func (e *VisionEngine) Process(ctx context.Context, imageData []byte, cfg Proces
 	}
 	ocrPrompt := prompt.BuildOCRPrompt(promptCfg)
 
-	// Encode image
 	base64Image := utils.EncodeBase64(imageData)
 
-	// Build Ollama request
+	maxAttempts := cfg.MaxRetries + 1
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
 	req := client.GenerateRequest{
 		Model:  cfg.Model,
 		Prompt: ocrPrompt,
 		Images: []string{base64Image},
 		Stream: false,
-		Format: "json",
+		Format: prompt.OCRJSONSchemaBytes(promptCfg),
 		Options: &client.ModelOptions{
 			Temperature: cfg.Temperature,
 			NumPredict:  4096,
 		},
 	}
 
-	// Call Ollama — attempt + 1 retry on JSON parse failure
 	var lastErr error
-	for attempt := 0; attempt <= 1; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		if attempt > 0 {
 			e.logger.Warn("retrying OCR request due to JSON parse failure",
 				slog.String("request_id", cfg.RequestID),
@@ -100,6 +113,9 @@ func (e *VisionEngine) Process(ctx context.Context, imageData []byte, cfg Proces
 
 		resp, err := e.client.Generate(ctx, req)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			return nil, fmt.Errorf("ollama generate (attempt %d): %w", attempt, err)
 		}
 
@@ -111,7 +127,6 @@ func (e *VisionEngine) Process(ctx context.Context, imageData []byte, cfg Proces
 			slog.Int("response_length", len(resp.Response)),
 		)
 
-		// Parse JSON
 		visionResp, err := utils.ParseAndValidateJSON(resp.Response)
 		if err != nil {
 			lastErr = fmt.Errorf("parse response (attempt %d): %w", attempt, err)
@@ -138,7 +153,7 @@ func (e *VisionEngine) Process(ctx context.Context, imageData []byte, cfg Proces
 		}, nil
 	}
 
-	return nil, fmt.Errorf("all attempts failed: %w", lastErr)
+	return nil, fmt.Errorf("%w: %v", ErrInvalidJSONResponse, lastErr)
 }
 
 // ProcessPDF handles multi-page PDF processing by converting pages to images
@@ -149,21 +164,19 @@ func (e *VisionEngine) ProcessPDF(ctx context.Context, pdfPath string, cfg Proce
 		slog.String("path", pdfPath),
 	)
 
-	pages, err := utils.PDFToImages(pdfPath)
+	pages, err := utils.PDFToImages(pdfPath, utils.PDFOptions{MaxPages: cfg.MaxPDFPages})
 	if err != nil {
-		return nil, fmt.Errorf("convert PDF to images: %w", err)
+		return nil, err
 	}
 
 	if len(pages) == 0 {
 		return nil, fmt.Errorf("PDF produced no pages")
 	}
 
-	// If single page, process directly
 	if len(pages) == 1 {
 		return e.Process(ctx, pages[0], cfg)
 	}
 
-	// Multi-page: process each and merge
 	var allResults []*ProcessResult
 	for i, page := range pages {
 		select {
@@ -185,7 +198,6 @@ func (e *VisionEngine) ProcessPDF(ctx context.Context, pdfPath string, cfg Proce
 		allResults = append(allResults, result)
 	}
 
-	// Merge results
 	return mergeResults(allResults), nil
 }
 
@@ -218,27 +230,44 @@ func mergeResults(results []*ProcessResult) *ProcessResult {
 	var totalLatency time.Duration
 
 	for i, r := range results {
+		pageNum := i + 1
 		totalLatency += r.Latency
 		merged.PromptTokens += r.PromptTokens
 		merged.EvalTokens += r.EvalTokens
 
 		if r.VisionResponse.Text != nil {
-			pagePrefix := fmt.Sprintf("--- Page %d ---\n", i+1)
+			pagePrefix := fmt.Sprintf("--- Page %d ---\n", pageNum)
 			rawParts = append(rawParts, pagePrefix+r.VisionResponse.Text.Raw)
-			merged.VisionResponse.Text.Lines = append(merged.VisionResponse.Text.Lines, r.VisionResponse.Text.Lines...)
+
+			for _, line := range r.VisionResponse.Text.Lines {
+				prefixedLine := line
+				if prefixedLine.Text != "" {
+					prefixedLine.Text = fmt.Sprintf("[Page %d] %s", pageNum, line.Text)
+				}
+				merged.VisionResponse.Text.Lines = append(merged.VisionResponse.Text.Lines, prefixedLine)
+			}
 		}
 
 		if r.VisionResponse.StructuredData != nil {
 			for k, v := range r.VisionResponse.StructuredData.KeyValuePairs {
-				merged.VisionResponse.StructuredData.KeyValuePairs[k] = v
+				key := fmt.Sprintf("page_%d_%s", pageNum, k)
+				merged.VisionResponse.StructuredData.KeyValuePairs[key] = v
 			}
-			merged.VisionResponse.StructuredData.Tables = append(
-				merged.VisionResponse.StructuredData.Tables,
-				r.VisionResponse.StructuredData.Tables...,
-			)
+
+			for _, table := range r.VisionResponse.StructuredData.Tables {
+				if len(table.Headers) > 0 {
+					prefixedHeaders := make([]string, len(table.Headers))
+					copy(prefixedHeaders, table.Headers)
+					prefixedHeaders[0] = fmt.Sprintf("[Page %d] %s", pageNum, prefixedHeaders[0])
+					table.Headers = prefixedHeaders
+				}
+				merged.VisionResponse.StructuredData.Tables = append(
+					merged.VisionResponse.StructuredData.Tables,
+					table,
+				)
+			}
 		}
 
-		// Use the summary from the last page if available
 		if r.VisionResponse.Summary != nil {
 			merged.VisionResponse.Summary = r.VisionResponse.Summary
 		}
